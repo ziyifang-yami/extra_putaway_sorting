@@ -6,6 +6,9 @@ Run: uvicorn server:app --host 0.0.0.0 --port 8506 --reload
 import logging
 import os
 import sys
+import time
+import threading
+import requests as http_requests
 from pathlib import Path
 
 import pandas as pd
@@ -43,6 +46,159 @@ except ImportError:
 WAREHOUSES = {"001": "LA", "002": "NJ", "101": "ON"}
 ZONES      = {"002": {"1": "NJFC", "2": "SFC"}}
 ZONE_LABEL_TO_ID = {"002": {"NJFC": 1, "SFC": 2}}
+
+# ---------------------------------------------------------------------------
+# WMS API client (token cache + auto-refresh)
+# ---------------------------------------------------------------------------
+class WmsClient:
+    def __init__(self):
+        self.base_url = os.environ.get("WMS_BASE_URL", "").rstrip("/")
+        self.user     = os.environ.get("WMS_USER", "")
+        self.password = os.environ.get("WMS_PASS", "")
+        self._token: str | None = None
+        self._token_ts: float = 0
+        self._lock = threading.Lock()
+        self._token_ttl = 3600 * 8  # 8 hours
+
+    def _login(self) -> str:
+        r = http_requests.post(
+            f"{self.base_url}/wms/common/loginWithoutWarehouseNum",
+            json={"email": self.user, "password": self.password},
+            timeout=10,
+        )
+        r.raise_for_status()
+        body = r.json().get("body") or {}
+        token = body.get("token")
+        if not token:
+            raise RuntimeError(f"WMS login failed: {r.text[:200]}")
+        log.info("WMS token refreshed")
+        return token
+
+    def token(self) -> str:
+        with self._lock:
+            if not self._token or time.time() - self._token_ts > self._token_ttl:
+                self._token = self._login()
+                self._token_ts = time.time()
+            return self._token
+
+    def _get_latest_po(self, sku: str, wh: str) -> str | None:
+        """Find the most recent inbound PO for this SKU in this warehouse."""
+        sql = text("""
+            SELECT inbound.reference_id AS po_number
+            FROM yamibuy_wh.wh_inbound_batch batch
+            INNER JOIN yamibuy_wh.wh_inbound inbound
+                ON batch.inbound_number = inbound.inbound_number
+            WHERE batch.item_number        = :sku
+              AND inbound.warehouse_number = :wh
+              AND batch.status            >= 0
+            ORDER BY batch.in_dtm DESC
+            LIMIT 1
+        """)
+        with engine.connect() as c:
+            df = pd.read_sql(sql, c, params={"sku": sku, "wh": wh})
+        if df.empty:
+            return None
+        return str(df.iloc[0]["po_number"])
+
+    def get_empty_bins(self, wh: str, zone_label: str = "", limit: int = 5) -> list[dict]:
+        """Fallback: pure empty bin list (no item info), used only if LR fails."""
+        if not self.base_url or not self.user:
+            return []
+        try:
+            resp = http_requests.post(
+                f"{self.base_url}/wms/service/queryAvaiBinList",
+                json={"warehouse_number": wh, "draw": 1, "startColumn": 0, "pageSize": 50},
+                headers={"token": self.token()},
+                timeout=12,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("body", {}) or {}
+            rows = data.get("data") or []
+            results = []
+            for r in rows:
+                loc_no = str(r.get("bin_sn") or "")
+                if not loc_no:
+                    continue
+                if zone_label == "NJFC" and loc_no.upper().startswith("S"):
+                    continue
+                if zone_label == "SFC" and not loc_no.upper().startswith("S"):
+                    continue
+                results.append({
+                    "location_no":    loc_no,
+                    "zone_id":        "",
+                    "zone_label":     zone_label or _zone_label(wh, None, loc_no),
+                    "location_type":  "Bin",
+                    "quantity":       0,
+                    "allocated_qty":  0,
+                    "expire_date":    None,
+                    "days_to_expire": None,
+                    "source":         "empty",
+                })
+                if len(results) >= limit:
+                    break
+            return results
+        except Exception as e:
+            log.warning(f"WMS get_empty_bins failed: {e}")
+            return []
+
+    def get_lr_recommendation(self, sku: str, wh: str, zone_label: str = "", limit: int = 5) -> list[dict]:
+        """Get LR recommendations using latest historical PO."""
+        if not self.base_url or not self.user:
+            return []
+        try:
+            po = self._get_latest_po(sku, wh)
+            if not po:
+                log.info(f"No historical PO found for {sku} in {wh}, falling back to empty bins")
+                return self.get_empty_bins(wh, zone_label, limit)
+
+            resp = http_requests.post(
+                f"{self.base_url}/wms/putaway/lr/queryLocationDetail",
+                json={"item_number": sku, "warehouse_number": wh, "po_number": po},
+                headers={"token": self.token()},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            body = resp.json().get("body") or {}
+            loc_list = body.get("locationList") or []
+
+            results = []
+            # Sort by ranking DESC, capacity ASC — best fit first
+            sorted_locs = sorted(loc_list,
+                                 key=lambda x: (-int(x.get("ranking") or 0),
+                                                int(x.get("capacity") or 0)))
+            for loc in sorted_locs:
+                loc_no = str(loc.get("location_no") or "")
+                if not loc_no:
+                    continue
+                actual_zone = _zone_label(wh, None, loc_no)
+                # zone filter
+                if zone_label == "NJFC" and loc_no.upper().startswith("S"):
+                    continue
+                if zone_label == "SFC" and not loc_no.upper().startswith("S"):
+                    continue
+                results.append({
+                    "location_no":    loc_no,
+                    "zone_id":        "",
+                    "zone_label":     actual_zone,
+                    "location_type":  "Bin",
+                    "quantity":       0,
+                    "allocated_qty":  0,
+                    "expire_date":    None,
+                    "days_to_expire": None,
+                    "source":         "lr",
+                })
+                if len(results) >= limit:
+                    break
+
+            if not results:
+                # LR returned nothing for this zone — fall back to empty bins
+                return self.get_empty_bins(wh, zone_label, limit)
+            return results
+        except Exception as e:
+            log.warning(f"WMS get_lr_recommendation failed: {e}")
+            return self.get_empty_bins(wh, zone_label, limit)
+
+wms_client = WmsClient()
 
 # ---------------------------------------------------------------------------
 # App
@@ -264,14 +420,15 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
             # SKU not found in this tote at all — warn and show lookup
             not_in_tote = True
             banner_source = "current_zone"
-            # Try selected zone first, fall back to all zones if empty
             if current:
                 banner_rows = current
             elif zone_id is not None:
-                banner_rows = get_current_locations(sku, wh, None)  # widen to other zone
+                banner_rows = get_current_locations(sku, wh, None)
                 banner_source = "current_other_zone"
             else:
-                banner_rows = []
+                # No stock anywhere — fall back to LR recommendation
+                banner_rows = wms_client.get_lr_recommendation(sku, wh, zone_label_display)
+                banner_source = "lr" if banner_rows else "none"
         else:
             # In tote but no assigned location — try selected zone, widen to other zone if empty
             if current:
@@ -280,9 +437,10 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
             elif zone_id is not None:
                 banner_source = "current_other_zone"
                 banner_rows = get_current_locations(sku, wh, None)
-            else:
-                banner_source = "none"
-                banner_rows = []
+            if not banner_rows:
+                # Still nothing — fall back to LR recommendation
+                banner_rows = wms_client.get_lr_recommendation(sku, wh, zone_label_display)
+                banner_source = "lr" if banner_rows else "none"
 
         return JSONResponse({
             "item_number": sku, "goods_en_name": item["goods_en_name"],
@@ -725,6 +883,12 @@ function renderResult(d) {
     if (d.banner_source === "current_other_zone") {
       const otherZone = banners.length > 0 ? (banners[0].zone_label || "another zone") : "another zone";
       html += `<div class="notice-bar">ℹ️ No stock in <b>${d.zone_filter || "selected zone"}</b> — showing <b>${otherZone}</b> locations instead</div>`;
+    }
+    if (d.banner_source === "empty_bin" || d.banner_source === "lr") {
+      const msg = d.banner_source === "lr"
+        ? "ℹ️ No existing stock — showing LR recommended locations"
+        : "ℹ️ No existing stock found — showing available empty bins";
+      html += `<div class="notice-bar">${msg}</div>`;
     }
     if (banners.length > 0) {
       // cross-zone: wrong_zone fallback to assigned in other zone, OR no-zone-filter result shown under a zone selection
