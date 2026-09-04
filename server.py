@@ -722,6 +722,10 @@ function renderResult(d) {
         html += `<div class="notice-bar">ℹ️ EXT putaway assigned to <b>${assignedLoc}</b> (${assignedZone}) — showing ${d.zone_filter} locations instead</div>`;
       }
     }
+    if (d.banner_source === "current_other_zone") {
+      const otherZone = banners.length > 0 ? (banners[0].zone_label || "another zone") : "another zone";
+      html += `<div class="notice-bar">ℹ️ No stock in <b>${d.zone_filter || "selected zone"}</b> — showing <b>${otherZone}</b> locations instead</div>`;
+    }
     if (banners.length > 0) {
       // cross-zone: wrong_zone fallback to assigned in other zone, OR no-zone-filter result shown under a zone selection
       const bannerZone  = banners[0].zone_label || "";
