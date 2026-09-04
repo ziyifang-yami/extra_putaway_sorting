@@ -87,8 +87,24 @@ class ReservationStore:
             return None
         return row["location_no"]
 
-    def get_session_occupancy(self, wh: str) -> dict[str, set[str]]:
-        """
+    def get_latest_reserved_location(self, wh: str, zone_label: str = "") -> str | None:
+        """Return the most recently reserved location_no (anchor for proximity sorting)."""
+        with self._connect() as conn:
+            if zone_label:
+                row = conn.execute("""
+                    SELECT location_no FROM reservations
+                    WHERE wh = ? AND zone_label = ? AND released_at IS NULL
+                    ORDER BY created_at DESC LIMIT 1
+                """, (wh, zone_label)).fetchone()
+            else:
+                row = conn.execute("""
+                    SELECT location_no FROM reservations
+                    WHERE wh = ? AND released_at IS NULL
+                    ORDER BY created_at DESC LIMIT 1
+                """, (wh,)).fetchone()
+        return row["location_no"] if row else None
+
+    def get_session_occupancy(self, wh: str) -> dict[str, set[str]]:        """
         Return {location_no: {sku1, sku2, ...}} for all active reservations in wh.
         Used to compute effective_item_count for can_random locations.
         """

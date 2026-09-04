@@ -456,7 +456,8 @@ def get_size_id(sku: str, wh: str, tote_qty: int = 1) -> int | None:
 
 def get_recommended_bins(sku: str, wh: str, zone_label: str,
                          tote_qty: int, occupancy: dict,
-                         limit: int = 5) -> list[dict]:
+                         limit: int = 5,
+                         continuous: bool = False) -> list[dict]:
     """
     Find available empty/mixed bins for a SKU using local SQL.
     Respects session occupancy (pre-occupied by other SKUs this session).
@@ -475,6 +476,14 @@ def get_recommended_bins(sku: str, wh: str, zone_label: str,
             zone_sql = ""
     else:
         zone_sql = ""
+
+    # Continuous mode: sort by proximity to last reserved location
+    if continuous:
+        anchor = reservation_store.get_latest_reserved_location(wh, zone_label)
+        order_sql = _build_continuous_order_sql(anchor)
+        log.info(f"Continuous mode anchor={anchor}")
+    else:
+        order_sql = "has_bind DESC, capacity ASC"
 
     sql = text(f"""
         SELECT
@@ -517,7 +526,8 @@ def get_recommended_bins(sku: str, wh: str, zone_label: str,
           )
           {zone_sql}
         HAVING capacity >= 1
-        ORDER BY has_bind DESC, capacity ASC
+        ORDER BY
+            {order_sql}
         LIMIT 50
     """)
     with engine.connect() as c:
@@ -555,6 +565,61 @@ def get_recommended_bins(sku: str, wh: str, zone_label: str,
     return results
 
 
+def _parse_location_prefix(location_no: str) -> dict:
+    """
+    Parse location_no into components for proximity sorting.
+    Format: {zone}{aisle2}{bay1}{level1}{shelf1}  e.g. B00911
+      zone  = location_no[0]       e.g. 'B'
+      aisle = location_no[1:3]     e.g. '00'
+      bay   = location_no[3]       e.g. '9'
+    """
+    loc = location_no.upper()
+    return {
+        "zone":  loc[0]    if len(loc) >= 1 else "",
+        "aisle": loc[1:3]  if len(loc) >= 3 else "",
+        "bay":   loc[3]    if len(loc) >= 4 else "",
+        "zone_aisle":     loc[:3] if len(loc) >= 3 else loc,
+        "zone_aisle_bay": loc[:4] if len(loc) >= 4 else loc,
+    }
+
+
+def _get_continuous_anchor(wh: str, zone_label: str) -> str | None:
+    """
+    Get the most recently reserved location_no in this session for proximity sorting.
+    Returns None if no active reservations exist.
+    """
+    occupancy = reservation_store.get_session_occupancy(wh)
+    if not occupancy:
+        return None
+    # Find most recent reservation from SQLite
+    anchor = reservation_store.get_latest_reserved_location(wh, zone_label)
+    return anchor
+
+
+def _build_continuous_order_sql(anchor: str) -> str:
+    """
+    Build ORDER BY expressions that prioritize locations near the anchor.
+    Priority: same zone+aisle+bay > same zone+aisle > same zone > any
+    """
+    if not anchor or len(anchor) < 4:
+        return "has_bind DESC, capacity ASC"
+
+    p = _parse_location_prefix(anchor)
+    zone           = p["zone"]
+    zone_aisle     = p["zone_aisle"]
+    zone_aisle_bay = p["zone_aisle_bay"]
+
+    return f"""
+        CASE
+            WHEN LEFT(l.location_no, 4) = '{zone_aisle_bay}' THEN 1
+            WHEN LEFT(l.location_no, 3) = '{zone_aisle}'     THEN 2
+            WHEN LEFT(l.location_no, 1) = '{zone}'           THEN 3
+            ELSE 4
+        END ASC,
+        has_bind DESC,
+        capacity ASC"""
+
+
 def _build_reserved_row(location_no: str, wh: str, zone_label: str) -> dict:
     """Build a banner row dict from a SQLite-reserved location."""
     actual_zone = zone_label or (
@@ -578,12 +643,13 @@ def _build_reserved_row(location_no: str, wh: str, zone_label: str) -> dict:
 # API
 # ---------------------------------------------------------------------------
 @app.get("/api/lookup")
-async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
+async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = "", continuous: str = "0"):
     if wh not in WAREHOUSES:
         return JSONResponse({"error": "invalid_warehouse"}, status_code=400)
 
     # Session reconciliation (runs once per session, zero cost otherwise)
     reservation_poller.on_lookup()
+    is_continuous = continuous == "1"
 
     zone_id: int | None = None
     zone_label_display = ""
@@ -658,7 +724,7 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
                 else:
                     # Step 5: local SQL recommendation
                     occupancy = reservation_store.get_session_occupancy(wh)
-                    banner_rows = get_recommended_bins(sku, wh, zone_label_display, tote_qty, occupancy)
+                    banner_rows = get_recommended_bins(sku, wh, zone_label_display, tote_qty, occupancy, continuous=is_continuous)
                     banner_source = "local_rec" if banner_rows else "none"
                     # Step 6: WMS empty bin fallback
                     if not banner_rows:
@@ -681,7 +747,7 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
                 else:
                     # Step 5: local SQL recommendation
                     occupancy = reservation_store.get_session_occupancy(wh)
-                    banner_rows = get_recommended_bins(sku, wh, zone_label_display, tote_qty, occupancy)
+                    banner_rows = get_recommended_bins(sku, wh, zone_label_display, tote_qty, occupancy, continuous=is_continuous)
                     banner_source = "local_rec" if banner_rows else "none"
                     # Step 6: WMS empty bin fallback
                     if not banner_rows:
@@ -782,6 +848,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 #zone-select.visible{display:block;}
 #zone-select.njfc{border-color:#34a853;color:#2e7d32;background-color:#f3fbf4;}
 #zone-select.sfc{border-color:#4285f4;color:#1a73e8;background-color:#f0f4ff;}
+#continuous-toggle{font-size:.78rem;font-weight:700;padding:5px 10px;border-radius:8px;border:1.5px solid #ddd;background:#fafafa;color:#999;cursor:pointer;white-space:nowrap;flex-shrink:0;}
+#continuous-toggle.on{border-color:#34a853;background:#f0faf3;color:#2e7d32;}
 /* Tote bar */
 #tote-bar{background:#fff;padding:8px 14px;border-bottom:1px solid #e0e0e0;flex-shrink:0;display:flex;align-items:center;gap:8px;}
 .tote-label{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#999;white-space:nowrap;flex-shrink:0;}
@@ -900,6 +968,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     <option value="NJFC" selected>NJFC</option>
     <option value="SFC">SFC</option>
   </select>
+  <button id="continuous-toggle" onclick="toggleContinuous()" title="Continuous mode: recommend nearby locations">📍 Off</button>
 </div>
 
 <div id="tote-bar">
@@ -949,6 +1018,7 @@ let currentZone = "NJFC";   // default 002 = NJFC
 let currentTote = "";
 let currentSku  = "";        // set on each lookup result
 let currentBannerSource = ""; // set on each lookup result
+let currentContinuous = false; // continuous mode toggle
 let lastQuery   = "";
 let debounce = null, bgBuffer = "", bgTimer = null;
 const SCAN_DELAY = 300;
@@ -973,6 +1043,14 @@ function onWhChange() {
     zoneSelect.classList.remove("njfc","sfc");
   }
   if (lastQuery) doLookup(lastQuery);
+}
+
+// ── Continuous mode ────────────────────────────────────────────────────────
+function toggleContinuous() {
+  currentContinuous = !currentContinuous;
+  const btn = document.getElementById("continuous-toggle");
+  btn.textContent = currentContinuous ? "📍 Continuous" : "📍 Off";
+  btn.classList.toggle("on", currentContinuous);
 }
 
 // ── Zone ───────────────────────────────────────────────────────────────────
@@ -1067,7 +1145,7 @@ async function doLookup(upc) {
   showLoading();
   upcInput.blur(); toteInput.blur();
   try {
-    const res = await fetch(`/api/lookup?upc=${encodeURIComponent(upc)}&wh=${encodeURIComponent(currentWh)}&zone=${encodeURIComponent(currentZone)}&tote=${encodeURIComponent(currentTote)}`);
+    const res = await fetch(`/api/lookup?upc=${encodeURIComponent(upc)}&wh=${encodeURIComponent(currentWh)}&zone=${encodeURIComponent(currentZone)}&tote=${encodeURIComponent(currentTote)}&continuous=${currentContinuous ? '1' : '0'}`);
     const data = await res.json();
     data.error ? showError(data.error) : renderResult(data);
   } catch(e) { showError("Network error: " + e.message); }
