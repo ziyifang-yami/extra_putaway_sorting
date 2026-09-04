@@ -1,0 +1,5 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+debug_1019167791.py
