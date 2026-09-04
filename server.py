@@ -123,10 +123,11 @@ class WmsClient:
                     continue
                 if zone_label == "SFC" and not loc_no.upper().startswith("S"):
                     continue
+                actual_zone = "SFC" if (wh == "002" and loc_no.upper().startswith("S")) else ("NJFC" if wh == "002" else _zone_label(wh, None, loc_no))
                 results.append({
                     "location_no":    loc_no,
                     "zone_id":        "",
-                    "zone_label":     zone_label or _zone_label(wh, None, loc_no),
+                    "zone_label":     actual_zone,
                     "location_type":  "Bin",
                     "quantity":       0,
                     "allocated_qty":  0,
@@ -170,7 +171,11 @@ class WmsClient:
                 loc_no = str(loc.get("location_no") or "")
                 if not loc_no:
                     continue
-                actual_zone = _zone_label(wh, None, loc_no)
+                # For 002/NJ: S-prefix = SFC, everything else = NJFC
+                if wh == "002":
+                    actual_zone = "SFC" if loc_no.upper().startswith("S") else "NJFC"
+                else:
+                    actual_zone = _zone_label(wh, None, loc_no)
                 # zone filter
                 if zone_label == "NJFC" and loc_no.upper().startswith("S"):
                     continue
@@ -189,6 +194,29 @@ class WmsClient:
                 })
                 if len(results) >= limit:
                     break
+
+            if not results and sorted_locs:
+                for loc in sorted_locs:
+                    loc_no = str(loc.get("location_no") or "")
+                    if not loc_no:
+                        continue
+                    if wh == "002":
+                        actual_zone = "SFC" if loc_no.upper().startswith("S") else "NJFC"
+                    else:
+                        actual_zone = _zone_label(wh, None, loc_no)
+                    results.append({
+                        "location_no":    loc_no,
+                        "zone_id":        "",
+                        "zone_label":     actual_zone,
+                        "location_type":  "Bin",
+                        "quantity":       0,
+                        "allocated_qty":  0,
+                        "expire_date":    None,
+                        "days_to_expire": None,
+                        "source":         "lr",  # caller checks zone_label vs zone_filter for cross-zone
+                    })
+                    if len(results) >= limit:
+                        break
 
             if not results:
                 # LR returned nothing for this zone — fall back to empty bins
@@ -885,12 +913,8 @@ function renderResult(d) {
       html += `<div class="notice-bar">ℹ️ No stock in <b>${d.zone_filter || "selected zone"}</b> — showing <b>${otherZone}</b> locations instead</div>`;
     }
     if (d.banner_source === "empty_bin" || d.banner_source === "lr") {
-      const msg = d.banner_source === "lr"
-        ? "ℹ️ No existing stock — showing LR recommended locations"
-        : "ℹ️ No existing stock found — showing available empty bins";
-      html += `<div class="notice-bar">${msg}</div>`;
-    }
-    if (banners.length > 0) {
+      html += `<div class="notice-bar">ℹ️ No existing stock — showing LR recommended locations</div>`;
+    }    if (banners.length > 0) {
       // cross-zone: wrong_zone fallback to assigned in other zone, OR no-zone-filter result shown under a zone selection
       const bannerZone  = banners[0].zone_label || "";
       const isCrossZone = d.zone_filter && bannerZone && bannerZone !== d.zone_filter;
