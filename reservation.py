@@ -104,7 +104,8 @@ class ReservationStore:
                 """, (wh,)).fetchone()
         return row["location_no"] if row else None
 
-    def get_session_occupancy(self, wh: str) -> dict[str, set[str]]:        """
+    def get_session_occupancy(self, wh: str) -> dict[str, set[str]]:
+        """
         Return {location_no: {sku1, sku2, ...}} for all active reservations in wh.
         Used to compute effective_item_count for can_random locations.
         """
