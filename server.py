@@ -427,14 +427,17 @@ def get_size_id(sku: str, wh: str, tote_qty: int = 1) -> int | None:
     sql2 = text("""
         SELECT s.size_id
         FROM yamibuy_wh.wh_location_size s
-        WHERE s.volume >= (
-            SELECT (CASE WHEN g.volume IS NULL OR g.volume = 0 THEN 50 ELSE g.volume END)
-                   * :qty
+        CROSS JOIN (
+            SELECT
+                (CASE WHEN g.volume IS NULL OR g.volume = 0 THEN 50 ELSE g.volume END) AS item_volume,
+                IFNULL(g.weight, 0) AS item_weight
             FROM yamibuy_im.im_item i
             INNER JOIN yamibuy_master.xysc_wearhouse_goods g ON i.goods_id = g.goods_id
             WHERE i.item_number = :sku
-        )
-          AND s.description  != 'High Value'
+        ) item
+        WHERE s.volume * s.fill_rate >= item.item_volume * :qty
+          AND s.weight_capacity      >= item.item_weight * :qty
+          AND s.description          != 'High Value'
         ORDER BY s.volume ASC
         LIMIT 1
     """)
@@ -730,6 +733,19 @@ async def release_reservation(tote_id: str):
     return JSONResponse({"ok": True, "tote_id": tote_id.upper(), "rows_released": n})
 
 
+@app.delete("/api/reserve/row/{row_id}")
+async def delete_reservation_row(row_id: int):
+    """Delete a single reservation row by id."""
+    import time
+    now = time.time()
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(reservation_store._db_path)
+    cur = conn.execute("UPDATE reservations SET released_at=? WHERE id=? AND released_at IS NULL", (now, row_id))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": cur.rowcount > 0, "row_id": row_id})
+
+
 @app.get("/api/reservations")
 async def list_reservations(wh: str = "002"):
     return JSONResponse({"reservations": reservation_store.list_active(wh)})
@@ -844,6 +860,23 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
   #print-label,#print-label *{visibility:visible !important;}
   #print-label{position:fixed;top:0;left:0;width:1.5in;height:0.5in;display:flex !important;align-items:center;justify-content:center;background:#fff;}
 }
+/* Reservation panel */
+#reservation-panel{background:#fff;border-top:1px solid #e0e0e0;flex-shrink:0;}
+#reservation-toggle{display:flex;align-items:center;gap:8px;padding:10px 14px;cursor:pointer;user-select:none;}
+#reservation-toggle:hover{background:#f5f5f5;}
+#reservation-title{font-size:.78rem;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.05em;flex:1;}
+#reservation-count-badge{font-size:.68rem;font-weight:700;background:#f9ab00;color:#fff;padding:2px 7px;border-radius:20px;display:none;}
+#reservation-chevron{font-size:.7rem;color:#aaa;transition:transform .2s;}
+#reservation-chevron.open{transform:rotate(90deg);}
+#reservation-list{padding:4px 14px 10px;max-height:220px;overflow-y:auto;}
+.res-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid #f5f5f5;font-size:.8rem;}
+.res-row:last-child{border-bottom:none;}
+.res-loc{font-family:"SF Mono","Roboto Mono",monospace;font-weight:700;color:#222;min-width:80px;}
+.res-sku{color:#888;flex:1;font-size:.75rem;}
+.res-tote{font-size:.72rem;color:#f9ab00;font-weight:600;background:#fff8e1;padding:1px 6px;border-radius:10px;}
+.res-del{background:none;border:none;color:#e57373;font-size:1rem;cursor:pointer;padding:2px 4px;line-height:1;}
+.res-del:hover{color:#c62828;}
+.res-empty{color:#bbb;font-size:.82rem;padding:8px 0;text-align:center;}
 #print-label{display:none;}
 </style>
 </head>
@@ -888,6 +921,17 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     <p>Scan a tote to start putaway<br>or scan a SKU to look up inventory</p>
   </div>
 </div>
+
+<!-- Reservation Panel -->
+<div id="reservation-panel">
+  <div id="reservation-toggle" onclick="toggleReservations()">
+    <span id="reservation-title">📋 Reserved Locations</span>
+    <span id="reservation-count-badge"></span>
+    <span id="reservation-chevron">▶</span>
+  </div>
+  <div id="reservation-list" style="display:none;"></div>
+</div>
+
 <div id="print-label">
   <div id="print-loc" style="font-family:monospace;font-size:1.8rem;font-weight:900;letter-spacing:2px;color:#000;"></div>
 </div>
@@ -1083,7 +1127,7 @@ function printLabel(loc) {
         tote_id: currentTote, sku: currentSku,
         location_no: loc, wh: currentWh, zone_label: currentZone
       })
-    }).catch(e => console.warn('reserve failed', e));
+    }).then(() => loadReservations()).catch(e => console.warn('reserve failed', e));
   }
 }
 
@@ -1197,8 +1241,69 @@ function showError(err) {
   resultArea.innerHTML = `<div class="error-msg">${msgs[err] || "❌ " + err}</div>`;
 }
 
+// ── Reservation Panel ─────────────────────────────────────────────────────
+let reservationOpen = false;
+
+async function loadReservations() {
+  try {
+    const res = await fetch(`/api/reservations?wh=${encodeURIComponent(currentWh)}`);
+    const data = await res.json();
+    const rows = data.reservations || [];
+    const badge = document.getElementById("reservation-count-badge");
+    const list  = document.getElementById("reservation-list");
+    // Update count badge
+    if (rows.length > 0) {
+      badge.textContent = rows.length;
+      badge.style.display = "inline-block";
+    } else {
+      badge.style.display = "none";
+    }
+    // Render list if open
+    if (reservationOpen) {
+      if (rows.length === 0) {
+        list.innerHTML = `<div class="res-empty">No active reservations</div>`;
+      } else {
+        list.innerHTML = rows.map(r => `
+          <div class="res-row" id="res-row-${r.id}">
+            <span class="res-loc">${r.location_no}</span>
+            <span class="res-sku">${r.sku}</span>
+            <span class="res-tote">${r.tote_id}</span>
+            <button class="res-del" onclick="deleteReservation(${r.id},'${r.tote_id}','${r.sku}')" title="Remove">✕</button>
+          </div>`).join("");
+      }
+    }
+  } catch(e) { console.warn("loadReservations failed", e); }
+}
+
+function toggleReservations() {
+  reservationOpen = !reservationOpen;
+  const list = document.getElementById("reservation-list");
+  const chevron = document.getElementById("reservation-chevron");
+  list.style.display = reservationOpen ? "block" : "none";
+  chevron.classList.toggle("open", reservationOpen);
+  if (reservationOpen) loadReservations();
+}
+
+async function deleteReservation(id, toteId, sku) {
+  // Delete single row via a dedicated endpoint, or release the whole tote+sku
+  try {
+    const res = await fetch(`/api/reserve/row/${id}`, { method: "DELETE" });
+    const data = await res.json();
+    if (data.ok) {
+      const row = document.getElementById(`res-row-${id}`);
+      if (row) row.remove();
+      await loadReservations();
+    }
+  } catch(e) { console.warn("deleteReservation failed", e); }
+}
+
+// Refresh badge count after every lookup
+const _origRenderResult = renderResult;
+
 // Initial focus on tote input
 toteInput.focus();
+// Load reservation count on startup
+loadReservations();
 </script>
 </body>
 </html>
