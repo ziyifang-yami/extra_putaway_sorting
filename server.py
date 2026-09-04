@@ -11,6 +11,7 @@ import threading
 import requests as http_requests
 from pathlib import Path
 
+from reservation import ReservationStore, ReservationPoller
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -229,6 +230,13 @@ class WmsClient:
 wms_client = WmsClient()
 
 # ---------------------------------------------------------------------------
+# Reservation store + session poller
+# ---------------------------------------------------------------------------
+_db_path = str(Path(__file__).resolve().parent / "reservations.db")
+reservation_store  = ReservationStore(db_path=_db_path)
+reservation_poller = ReservationPoller(reservation_store, engine, idle_timeout=300)
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI()
@@ -389,6 +397,174 @@ def get_ext_tote_summary(sku: str, wh: str) -> list[dict]:
     return rows
 
 
+def get_size_id(sku: str, wh: str, tote_qty: int = 1) -> int | None:
+    """
+    Resolve the best-fit bin size_id for a SKU.
+    Method 1: historical binding (most common size this SKU has been placed in).
+    Method 2 (fallback): smallest size whose volume >= tote_qty × item volume.
+    """
+    # Method 1 — historical binding
+    sql1 = text("""
+        SELECT l.size_id, COUNT(1) AS cnt
+        FROM yamibuy_wh.wh_storage_location_item sli
+        INNER JOIN yamibuy_wh.wh_storage_location l
+            ON sli.storage_location_id = l.rec_id
+            AND l.warehouse_number     = sli.warehouse_number
+        WHERE sli.item_number      = :sku
+          AND sli.warehouse_number = :wh
+          AND l.location_type      = 4
+        GROUP BY l.size_id
+        ORDER BY cnt DESC
+        LIMIT 1
+    """)
+    with engine.connect() as c:
+        df1 = pd.read_sql(sql1, c, params={"sku": sku, "wh": wh})
+    if not df1.empty:
+        return int(df1.iloc[0]["size_id"])
+
+    # Method 2 — volume matching (total volume = qty × unit volume)
+    qty = max(tote_qty, 1)
+    sql2 = text("""
+        SELECT s.size_id
+        FROM yamibuy_wh.wh_location_size s
+        WHERE s.volume >= (
+            SELECT (CASE WHEN g.volume IS NULL OR g.volume = 0 THEN 50 ELSE g.volume END)
+                   * :qty
+            FROM yamibuy_im.im_item i
+            INNER JOIN yamibuy_master.xysc_wearhouse_goods g ON i.goods_id = g.goods_id
+            WHERE i.item_number = :sku
+        )
+          AND s.description  != 'High Value'
+        ORDER BY s.volume ASC
+        LIMIT 1
+    """)
+    with engine.connect() as c:
+        df2 = pd.read_sql(sql2, c, params={"sku": sku, "qty": qty})
+    if not df2.empty:
+        return int(df2.iloc[0]["size_id"])
+    return None
+
+
+def get_recommended_bins(sku: str, wh: str, zone_label: str,
+                         tote_qty: int, occupancy: dict,
+                         limit: int = 5) -> list[dict]:
+    """
+    Find available empty/mixed bins for a SKU using local SQL.
+    Respects session occupancy (pre-occupied by other SKUs this session).
+    """
+    size_id = get_size_id(sku, wh, tote_qty)
+    if size_id is None:
+        return []
+
+    # Zone filter
+    if wh == "002":
+        if zone_label == "NJFC":
+            zone_sql = "AND l.location_no NOT LIKE 'S%'"
+        elif zone_label == "SFC":
+            zone_sql = "AND l.location_no LIKE 'S%'"
+        else:
+            zone_sql = ""
+    else:
+        zone_sql = ""
+
+    sql = text(f"""
+        SELECT
+            l.location_no,
+            l.zone_id,
+            l.item_count,
+            l.max_sku,
+            l.can_random,
+            CASE WHEN sli.rec_id IS NULL THEN 0 ELSE 1 END AS has_bind,
+            FLOOR(
+                (s.volume * IFNULL(rate.fill_rate/100, 1) * s.fill_rate - l.g_volume)
+                / item.volume
+            ) AS capacity
+        FROM yamibuy_wh.wh_storage_location l
+        INNER JOIN yamibuy_wh.wh_location_size s ON s.size_id = l.size_id
+        LEFT JOIN yamibuy_wh.wh_location_sku_fill_rate rate
+            ON rate.location_type     = l.location_type
+            AND rate.storage_type     = s.storage_type
+            AND rate.max_sku          = l.max_sku
+            AND rate.warehouse_number = l.warehouse_number
+        LEFT JOIN yamibuy_wh.wh_storage_location_item sli
+            ON l.rec_id            = sli.storage_location_id
+            AND l.warehouse_number = sli.warehouse_number
+            AND sli.item_number    = :sku
+        CROSS JOIN (
+            SELECT CASE WHEN g.volume IS NULL OR g.volume = 0 THEN 50 ELSE g.volume END AS volume
+            FROM yamibuy_im.im_item i
+            INNER JOIN yamibuy_master.xysc_wearhouse_goods g ON i.goods_id = g.goods_id
+            WHERE i.item_number = :sku
+        ) item
+        WHERE l.location_type    = 4
+          AND l.warehouse_number = :wh
+          AND l.size_id          = :size_id
+          AND l.business_flag    = 0
+          AND LEFT(l.location_no, 2) != 'DC'
+          AND (
+              l.item_count = 0
+              OR sli.rec_id IS NOT NULL
+              OR l.can_random = 1
+          )
+          {zone_sql}
+        HAVING capacity >= 1
+        ORDER BY has_bind DESC, capacity ASC
+        LIMIT 50
+    """)
+    with engine.connect() as c:
+        df = pd.read_sql(sql, c, params={"sku": sku, "wh": wh, "size_id": size_id})
+
+    results = []
+    for _, row in df.iterrows():
+        loc_no = str(row["location_no"])
+        item_count = int(row["item_count"]) if pd.notna(row["item_count"]) else 0
+        has_bind   = int(row["has_bind"])
+        can_random = int(row["can_random"]) if pd.notna(row["can_random"]) else 0
+        max_sku    = int(row["max_sku"]) if pd.notna(row["max_sku"]) else 1
+
+        # Post-filter: for can_random mixed locations, check effective item count
+        if item_count > 0 and has_bind == 0 and can_random:
+            session_other = len(occupancy.get(loc_no, set()) - {sku})
+            if max_sku <= item_count + session_other:
+                continue  # no room
+
+        actual_zone = "SFC" if (wh == "002" and loc_no.upper().startswith("S")) else (
+                      "NJFC" if wh == "002" else "")
+        results.append({
+            "location_no":    loc_no,
+            "zone_id":        str(int(row["zone_id"])) if pd.notna(row["zone_id"]) else "",
+            "zone_label":     actual_zone,
+            "location_type":  "Bin",
+            "quantity":       0,
+            "allocated_qty":  0,
+            "expire_date":    None,
+            "days_to_expire": None,
+            "source":         "local_rec",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _build_reserved_row(location_no: str, wh: str, zone_label: str) -> dict:
+    """Build a banner row dict from a SQLite-reserved location."""
+    actual_zone = zone_label or (
+        "SFC" if (wh == "002" and location_no.upper().startswith("S")) else
+        "NJFC" if wh == "002" else ""
+    )
+    return {
+        "location_no":    location_no,
+        "zone_id":        "",
+        "zone_label":     actual_zone,
+        "location_type":  "Bin",
+        "quantity":       0,
+        "allocated_qty":  0,
+        "expire_date":    None,
+        "days_to_expire": None,
+        "source":         "reserved",
+    }
+
+
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
@@ -396,6 +572,9 @@ def get_ext_tote_summary(sku: str, wh: str) -> list[dict]:
 async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
     if wh not in WAREHOUSES:
         return JSONResponse({"error": "invalid_warehouse"}, status_code=400)
+
+    # Session reconciliation (runs once per session, zero cost otherwise)
+    reservation_poller.on_lookup()
 
     zone_id: int | None = None
     zone_label_display = ""
@@ -411,6 +590,15 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
         current   = get_current_locations(sku, wh, zone_id)
         ext_totes = get_ext_tote_summary(sku, wh)
 
+        # tote_qty for size recommendation (qty of this SKU in current tote)
+        tote_upper = tote.strip().upper() if tote else ""
+        tote_qty = 1
+        if tote_upper:
+            for t in ext_totes:
+                if t["tote_id"] == tote_upper:
+                    tote_qty = max(t["total_qty"], 1)
+                    break
+
         if not tote:
             return JSONResponse({
                 "item_number": sku, "goods_en_name": item["goods_en_name"],
@@ -419,7 +607,6 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
                 "mode": "lookup", "current": current, "ext_totes": ext_totes,
             })
 
-        tote_upper = tote.strip().upper()
         wrong_zone = False
         not_in_tote = False
         banner_source = "none"
@@ -454,11 +641,22 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
                 banner_rows = get_current_locations(sku, wh, None)
                 banner_source = "current_other_zone"
             else:
-                # No stock anywhere — fall back to LR recommendation
-                banner_rows = wms_client.get_lr_recommendation(sku, wh, zone_label_display)
-                banner_source = "lr" if banner_rows else "none"
+                # No stock anywhere — step 4: reuse SQLite reservation
+                reused = reservation_store.get_location_for_sku(sku, wh, zone_label_display)
+                if reused:
+                    banner_rows = [_build_reserved_row(reused, wh, zone_label_display)]
+                    banner_source = "reserved"
+                else:
+                    # Step 5: local SQL recommendation
+                    occupancy = reservation_store.get_session_occupancy(wh)
+                    banner_rows = get_recommended_bins(sku, wh, zone_label_display, tote_qty, occupancy)
+                    banner_source = "local_rec" if banner_rows else "none"
+                    # Step 6: WMS empty bin fallback
+                    if not banner_rows:
+                        banner_rows = wms_client.get_empty_bins(wh, zone_label_display)
+                        banner_source = "empty_bin" if banner_rows else "none"
         else:
-            # In tote but no assigned location — try selected zone, widen to other zone if empty
+            # In tote but no assigned location — try current stock first
             if current:
                 banner_source = "current_zone"
                 banner_rows = current
@@ -466,9 +664,20 @@ async def lookup(upc: str, wh: str = "002", zone: str = "", tote: str = ""):
                 banner_source = "current_other_zone"
                 banner_rows = get_current_locations(sku, wh, None)
             if not banner_rows:
-                # Still nothing — fall back to LR recommendation
-                banner_rows = wms_client.get_lr_recommendation(sku, wh, zone_label_display)
-                banner_source = "lr" if banner_rows else "none"
+                # Step 4: reuse SQLite reservation for same SKU
+                reused = reservation_store.get_location_for_sku(sku, wh, zone_label_display)
+                if reused:
+                    banner_rows = [_build_reserved_row(reused, wh, zone_label_display)]
+                    banner_source = "reserved"
+                else:
+                    # Step 5: local SQL recommendation
+                    occupancy = reservation_store.get_session_occupancy(wh)
+                    banner_rows = get_recommended_bins(sku, wh, zone_label_display, tote_qty, occupancy)
+                    banner_source = "local_rec" if banner_rows else "none"
+                    # Step 6: WMS empty bin fallback
+                    if not banner_rows:
+                        banner_rows = wms_client.get_empty_bins(wh, zone_label_display)
+                        banner_source = "empty_bin" if banner_rows else "none"
 
         return JSONResponse({
             "item_number": sku, "goods_en_name": item["goods_en_name"],
@@ -495,6 +704,35 @@ async def debug_location(loc: str, wh: str = "002"):
     row = df.iloc[0].to_dict()
     row["zone_label"] = _zone_label(wh, row["zone_id"], str(row.get("location_no", "")))
     return JSONResponse(row)
+
+
+@app.post("/api/reserve")
+async def reserve_location(body: dict):
+    tote_id     = str(body.get("tote_id", "")).strip().upper()
+    sku         = str(body.get("sku", "")).strip()
+    location_no = str(body.get("location_no", "")).strip()
+    wh          = str(body.get("wh", "")).strip()
+    zone_label  = str(body.get("zone_label", "")).strip()
+    if not tote_id.startswith("EXT"):
+        return JSONResponse({"error": "tote_id must start with EXT"}, status_code=400)
+    if wh not in WAREHOUSES:
+        return JSONResponse({"error": "invalid_warehouse"}, status_code=400)
+    if not sku or not location_no:
+        return JSONResponse({"error": "sku and location_no required"}, status_code=400)
+    result = reservation_store.reserve(tote_id, sku, location_no, wh, zone_label)
+    log.info(f"Reserved: tote={tote_id} sku={sku} loc={location_no} wh={wh}")
+    return JSONResponse({"ok": True, **result})
+
+
+@app.delete("/api/reserve/{tote_id}")
+async def release_reservation(tote_id: str):
+    n = reservation_store.release_by_tote(tote_id.strip().upper())
+    return JSONResponse({"ok": True, "tote_id": tote_id.upper(), "rows_released": n})
+
+
+@app.get("/api/reservations")
+async def list_reservations(wh: str = "002"):
+    return JSONResponse({"reservations": reservation_store.list_active(wh)})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -601,10 +839,10 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 .hint .icon{font-size:3rem;}.hint p{font-size:.85rem;text-align:center;}
 /* Print */
 @media print{
-  @page{margin:0;}
+  @page{margin:0;size:1.5in 0.5in landscape;}
   body *{visibility:hidden !important;}
   #print-label,#print-label *{visibility:visible !important;}
-  #print-label{position:fixed;top:0;left:0;width:100%;height:100%;display:flex !important;align-items:center;justify-content:center;background:#fff;}
+  #print-label{position:fixed;top:0;left:0;width:1.5in;height:0.5in;display:flex !important;align-items:center;justify-content:center;background:#fff;}
 }
 #print-label{display:none;}
 </style>
@@ -651,7 +889,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
   </div>
 </div>
 <div id="print-label">
-  <div id="print-loc" style="font-family:monospace;font-size:5rem;font-weight:900;letter-spacing:4px;color:#000;"></div>
+  <div id="print-loc" style="font-family:monospace;font-size:1.8rem;font-weight:900;letter-spacing:2px;color:#000;"></div>
 </div>
 
 <script>
@@ -659,6 +897,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 let currentWh   = "002";
 let currentZone = "NJFC";   // default 002 = NJFC
 let currentTote = "";
+let currentSku  = "";        // set on each lookup result
+let currentBannerSource = ""; // set on each lookup result
 let lastQuery   = "";
 let debounce = null, bgBuffer = "", bgTimer = null;
 const SCAN_DELAY = 300;
@@ -795,9 +1035,12 @@ function zoneChip(label, big) {
 
 function destBanner(type, loc, crossZone) {
   const isA = type === "assigned";
-  // Color: cross-zone → yellow, same-zone → zone color (NJFC=red, SFC=blue), no zone → green
+  const isEmptyLoc = loc.source === "local_rec" || loc.source === "empty_bin";
+  // Color logic
   let bannerClass;
-  if (crossZone) {
+  if (isEmptyLoc) {
+    bannerClass = "warn";   // red — empty location assignment
+  } else if (crossZone) {
     bannerClass = "zone-cross";
   } else if (loc.zone_label === "NJFC") {
     bannerClass = "zone-njfc";
@@ -806,6 +1049,9 @@ function destBanner(type, loc, crossZone) {
   } else {
     bannerClass = isA ? "assigned" : "current";
   }
+  const label = isEmptyLoc ? "Recommend Empty Location"
+              : isA        ? "Assigned Location"
+              :               "Recommended Location";
   const mp = isA
     ? [loc.tote_id ? `Tote: ${loc.tote_id}` : "", loc.location_type || "", loc.problem_qty ? `Qty: ${loc.problem_qty}` : ""]
     : [loc.quantity != null ? `Qty: ${loc.quantity}` : "", loc.expire_date ? `Exp: ${loc.expire_date}` : ""];
@@ -813,7 +1059,7 @@ function destBanner(type, loc, crossZone) {
   const safeLocNo = (loc.location_no || "").replace(/'/g, "\\'");
   return `<div class="dest-banner ${bannerClass}">
     <div class="dest-left">
-      <div class="dest-label">${isA ? "Assigned Location" : "Recommended Location"}</div>
+      <div class="dest-label">${label}</div>
       <div class="dest-loc">${loc.location_no || "—"}</div>
       ${meta ? `<div class="dest-meta">${meta}</div>` : ""}
     </div>
@@ -827,6 +1073,18 @@ function destBanner(type, loc, crossZone) {
 function printLabel(loc) {
   document.getElementById("print-loc").textContent = loc;
   window.print();
+  // Reserve only for empty-location recommendations
+  if ((currentBannerSource === "local_rec" || currentBannerSource === "empty_bin")
+      && currentTote && currentSku && currentWh) {
+    fetch('/api/reserve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        tote_id: currentTote, sku: currentSku,
+        location_no: loc, wh: currentWh, zone_label: currentZone
+      })
+    }).catch(e => console.warn('reserve failed', e));
+  }
 }
 
 function extToteStrip(totes, activeTote) {
@@ -864,6 +1122,8 @@ function sectionCard(title, dotCls, rows) {
 
 // ── Main render ────────────────────────────────────────────────────────────
 function renderResult(d) {
+  currentSku = d.item_number || "";
+  currentBannerSource = d.banner_source || "";
   const name = d.goods_en_name || d.goods_name || "—";
   let html = `<div class="product-pill"><span class="sku-badge">${d.item_number}</span><span class="product-name">${name}</span></div>`;
 
@@ -912,8 +1172,8 @@ function renderResult(d) {
       const otherZone = banners.length > 0 ? (banners[0].zone_label || "another zone") : "another zone";
       html += `<div class="notice-bar">ℹ️ No stock in <b>${d.zone_filter || "selected zone"}</b> — showing <b>${otherZone}</b> locations instead</div>`;
     }
-    if (d.banner_source === "empty_bin" || d.banner_source === "lr") {
-      html += `<div class="notice-bar">ℹ️ No existing stock — showing LR recommended locations</div>`;
+    if (d.banner_source === "empty_bin" || d.banner_source === "local_rec") {
+      html += `<div class="notice-bar">ℹ️ No existing stock — showing empty location recommendation</div>`;
     }    if (banners.length > 0) {
       // cross-zone: wrong_zone fallback to assigned in other zone, OR no-zone-filter result shown under a zone selection
       const bannerZone  = banners[0].zone_label || "";
