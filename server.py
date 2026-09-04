@@ -818,6 +818,25 @@ async def delete_reservation_row(row_id: int):
     return JSONResponse({"ok": cur.rowcount > 0, "row_id": row_id})
 
 
+@app.post("/api/reserve/clear")
+async def clear_reservations(body: dict):
+    """Clear all active reservations for a warehouse (called when toggling continuous mode)."""
+    wh = str(body.get("wh", "")).strip()
+    if wh not in WAREHOUSES:
+        return JSONResponse({"error": "invalid_warehouse"}, status_code=400)
+    import time, sqlite3 as _sqlite3
+    now = time.time()
+    conn = _sqlite3.connect(reservation_store._db_path)
+    cur = conn.execute(
+        "UPDATE reservations SET released_at=? WHERE wh=? AND released_at IS NULL",
+        (now, wh)
+    )
+    conn.commit()
+    conn.close()
+    log.info(f"Cleared {cur.rowcount} reservations for wh={wh} (continuous mode toggle)")
+    return JSONResponse({"ok": True, "cleared": cur.rowcount})
+
+
 @app.get("/api/reservations")
 async def list_reservations(wh: str = "002"):
     return JSONResponse({"reservations": reservation_store.list_active(wh)})
@@ -968,7 +987,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
     <option value="NJFC" selected>NJFC</option>
     <option value="SFC">SFC</option>
   </select>
-  <button id="continuous-toggle" onclick="toggleContinuous()" title="Continuous mode: recommend nearby locations">📍 Off</button>
+  <button id="continuous-toggle" onclick="toggleContinuous()" title="Continuous mode: recommend nearby locations">📍 Continuous Mode</button>
 </div>
 
 <div id="tote-bar">
@@ -1049,8 +1068,16 @@ function onWhChange() {
 function toggleContinuous() {
   currentContinuous = !currentContinuous;
   const btn = document.getElementById("continuous-toggle");
-  btn.textContent = currentContinuous ? "📍 Continuous" : "📍 Off";
+  btn.textContent = currentContinuous ? "📍 Continuous Mode" : "📍 Continuous Mode";
   btn.classList.toggle("on", currentContinuous);
+  if (currentContinuous) {
+    // New batch — clear all previous reservations for this wh
+    fetch('/api/reserve/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({wh: currentWh})
+    }).then(() => loadReservations()).catch(e => console.warn('clear failed', e));
+  }
 }
 
 // ── Zone ───────────────────────────────────────────────────────────────────
@@ -1253,6 +1280,23 @@ function renderResult(d) {
   currentSku = d.item_number || "";
   currentBannerSource = d.banner_source || "";
   const name = d.goods_en_name || d.goods_name || "—";
+
+  // Continuous mode: auto-reserve on first lookup (no print required)
+  // This sets the anchor for proximity sorting on subsequent lookups
+  if (currentContinuous
+      && (currentBannerSource === "local_rec" || currentBannerSource === "empty_bin")
+      && currentTote && currentSku && currentWh
+      && d.banner_rows && d.banner_rows.length > 0) {
+    const loc = d.banner_rows[0].location_no;
+    fetch('/api/reserve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        tote_id: currentTote, sku: currentSku,
+        location_no: loc, wh: currentWh, zone_label: currentZone
+      })
+    }).then(() => loadReservations()).catch(e => console.warn('auto-reserve failed', e));
+  }
   let html = `<div class="product-pill"><span class="sku-badge">${d.item_number}</span><span class="product-name">${name}</span></div>`;
 
   if (d.mode === "lookup") {
