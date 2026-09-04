@@ -300,6 +300,12 @@ def get_tote_assigned_location(tote: str, sku: str, wh: str) -> dict | None:
         FROM yamibuy_wh.wh_pending_item p
         LEFT JOIN yamibuy_wh.wh_storage_location sl
             ON p.to_location = sl.location_no AND p.warehouse_number = sl.warehouse_number
+        -- Validate: to_location must actually have inventory for this SKU
+        INNER JOIN yamibuy_wh.wh_inventory_transaction inv
+            ON p.to_location      = inv.location_no
+            AND p.warehouse_number = inv.warehouse_number
+            AND p.item_number      = inv.item_number
+            AND inv.quantity       > 0
         WHERE p.warehouse_number = :wh AND p.item_number = :sku AND p.target = :tote
           AND p.status IN (0,1) AND p.to_location IS NOT NULL AND p.to_location != ''
         ORDER BY p.in_dtm DESC LIMIT 1
