@@ -959,6 +959,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 #reservation-toggle:hover{background:#f5f5f5;}
 #reservation-title{font-size:.78rem;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.05em;flex:1;}
 #reservation-count-badge{font-size:.68rem;font-weight:700;background:#f9ab00;color:#fff;padding:2px 7px;border-radius:20px;display:none;}
+#clear-all-btn{background:none;border:1px solid #e57373;color:#e57373;border-radius:6px;font-size:.7rem;font-weight:600;padding:2px 8px;cursor:pointer;margin-left:auto;margin-right:6px;}
+#clear-all-btn:hover{background:#fde8e8;}
 #reservation-chevron{font-size:.7rem;color:#aaa;transition:transform .2s;}
 #reservation-chevron.open{transform:rotate(90deg);}
 #reservation-list{padding:4px 14px 10px;max-height:220px;overflow-y:auto;}
@@ -1021,6 +1023,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
   <div id="reservation-toggle" onclick="toggleReservations()">
     <span id="reservation-title">📋 Reserved Locations</span>
     <span id="reservation-count-badge"></span>
+    <button id="clear-all-btn" onclick="event.stopPropagation(); clearAllReservations()" style="display:none;">🗑 Clear All</button>
     <span id="reservation-chevron">▶</span>
   </div>
   <div id="reservation-list" style="display:none;"></div>
@@ -1372,6 +1375,16 @@ function showError(err) {
 // ── Reservation Panel ─────────────────────────────────────────────────────
 let reservationOpen = false;
 
+async function clearAllReservations() {
+  if (!confirm('Clear all reserved locations?')) return;
+  await fetch('/api/reserve/clear', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({wh: currentWh})
+  });
+  await loadReservations();
+}
+
 async function loadReservations() {
   try {
     const res = await fetch(`/api/reservations?wh=${encodeURIComponent(currentWh)}`);
@@ -1383,8 +1396,10 @@ async function loadReservations() {
     if (rows.length > 0) {
       badge.textContent = rows.length;
       badge.style.display = "inline-block";
+      document.getElementById("clear-all-btn").style.display = "inline-block";
     } else {
       badge.style.display = "none";
+      document.getElementById("clear-all-btn").style.display = "none";
     }
     // Render list if open
     if (reservationOpen) {
